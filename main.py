@@ -2,7 +2,7 @@ import base64
 import io
 import re
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 import fitz  # PyMuPDF
 from fastapi import FastAPI, File, UploadFile
@@ -40,7 +40,7 @@ BENGALI_REPLACEMENTS = {
 }
 
 
-def clean_bengali_text(text: str | None) -> str:
+def clean_bengali_text(text: Optional[str]) -> str:
     if not text:
         return ""
     for old, new in BENGALI_REPLACEMENTS.items():
@@ -56,7 +56,7 @@ def normalize(text: str) -> str:
     return re.sub(r"[ \t\r\n]+", " ", text or " ").strip()
 
 
-def extract_between(text: str, start: str, end: str | None = None) -> str:
+def extract_between(text: str, start: str, end: Optional[str] = None) -> str:
     """Extract text between labels, tolerating line breaks and extra spaces."""
     if not text:
         return ""
@@ -116,7 +116,7 @@ def extract_text_fields(text: str) -> dict[str, str]:
     return fields
 
 
-def extract_images(doc: fitz.Document) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+def extract_images(doc: fitz.Document) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
     """Find portrait and signature across every page of a 1–3 page PDF."""
     candidates: list[dict[str, Any]] = []
     for page_number, page in enumerate(doc):
@@ -169,7 +169,7 @@ def extract_images(doc: fitz.Document) -> tuple[dict[str, Any] | None, dict[str,
     return portrait, signature
 
 
-def image_to_base64(image: dict[str, Any] | None) -> str | None:
+def image_to_base64(image: Optional[dict[str, Any]]) -> Optional[str]:
     return base64.b64encode(image["bytes"]).decode("ascii") if image else None
 
 

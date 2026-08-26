@@ -1,94 +1,224 @@
-import fitz  # PyMuPDF
-from fastapi import FastAPI, UploadFile, File
-import io, base64
+import base64
+import io
+import re
+from datetime import datetime
+from typing import Any
 
-app = FastAPI()
+import fitz  # PyMuPDF
+from fastapi import FastAPI, File, UploadFile
+
+app = FastAPI(title="Image and PDF Data Extractor API", version="2.0.0")
+
+
+# Common broken Bengali word fixes observed in NID PDF text extraction.
+BENGALI_REPLACEMENTS = {
+    "খাতু ন": "খাতুন",
+    "আব্দু ল": "আব্দুল",
+    "বর্ম ন": "বর্মন",
+    "হোসে ন": "হোসেন",
+    "রহমা ন": "রহমান",
+    "বেগ ম": "বেগম",
+    "আল ম": "আলম",
+    "উদ্দি ন": "উদ্দিন",
+    "ইসলাম ম": "ইসলাম",
+    "আহমে দ": "আহমেদ",
+    "আলী ম": "আলীম",
+    "সরকা র": "সরকার",
+    "মিঞা য়": "মিঞায়",
+    " মি য়া": " মিয়া",
+    " মিঞা": " মিঞা",
+    "তালি ক": "তালিকা",
+    "কু লসুম": "কুলসুম",
+    "পুকু র": "পুকুর",
+    "আবদু ল": "আবদুল",
+    "সিফাতু ন": "সিফাতুন",
+    "নতু ন": "নতুন",
+    "সর্দা র": "সর্দার",
+    "আরসাফু ল": "আরসাফুল",
+    "ISL AM": "ISLAM",
+    "রহিদু ল": "রহিদুল",
+}
+
+
+def clean_bengali_text(text: str | None) -> str:
+    if not text:
+        return ""
+    for old, new in BENGALI_REPLACEMENTS.items():
+        text = text.replace(old, new)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def convert_to_bangla(number: Any) -> str:
+    return str(number).translate(str.maketrans("0123456789", "০১২৩৪৫৬৭৮৯"))
+
+
+def normalize(text: str) -> str:
+    return re.sub(r"[ \t\r\n]+", " ", text or " ").strip()
+
+
+def extract_between(text: str, start: str, end: str | None = None) -> str:
+    """Extract text between labels, tolerating line breaks and extra spaces."""
+    if not text:
+        return ""
+    start_pattern = re.escape(start).replace(r"\ ", r"\s*")
+    if end:
+        end_pattern = re.escape(end).replace(r"\ ", r"\s*")
+        match = re.search(start_pattern + r"\s*(.*?)\s*" + end_pattern, text, re.I | re.S)
+    else:
+        match = re.search(start_pattern + r"\s*(.*?)(?:\n|$)", text, re.I | re.S)
+    return normalize(match.group(1)) if match else ""
+
+
+def first_nonempty(*values: str) -> str:
+    return next((normalize(v) for v in values if normalize(v)), "")
+
+
+def extract_text_fields(text: str) -> dict[str, str]:
+    # Text from this kind of PDF may place labels and values on separate lines.
+    fields = {
+        "nationalId": extract_between(text, "National ID", "Pin"),
+        "pin": extract_between(text, "Pin", "Status"),
+        "status": extract_between(text, "Status", "Afis Status"),
+        "nameBangla": extract_between(text, "Name(Bangla)", "Name(English)"),
+        "nameEnglish": extract_between(text, "Name(English)", "Date of Birth"),
+        "dateOfBirth": extract_between(text, "Date of Birth", "Birth Place"),
+        "birthPlace": extract_between(text, "Birth Place", "Birth Other"),
+        "fatherName": extract_between(text, "Father Name", "Mother Name"),
+        "motherName": extract_between(text, "Mother Name", "Spouse Name"),
+        "spouseName": extract_between(text, "Spouse Name", "Gender"),
+        "gender": extract_between(text, "Gender", "Marital"),
+        "marital": extract_between(text, "Marital", "Occupation"),
+        "occupation": extract_between(text, "Occupation", "Disability"),
+        "religion": extract_between(text, "Religion", "Religion Other"),
+        "bloodGroup": extract_between(text, "Blood Group", "TIN"),
+        "laptopId": extract_between(text, "Laptop ID", "NID Father"),
+    }
+
+    # A few PDFs flatten values into lines, so use label-based fallbacks.
+    lines = [normalize(line) for line in text.splitlines() if normalize(line)]
+    for index, line in enumerate(lines):
+        for label, key in [
+            ("National ID", "nationalId"), ("Pin", "pin"), ("Name(Bangla)", "nameBangla"),
+            ("Name(English)", "nameEnglish"), ("Date of Birth", "dateOfBirth"),
+            ("Father Name", "fatherName"), ("Mother Name", "motherName"),
+            ("Gender", "gender"), ("Religion", "religion"), ("Blood Group", "bloodGroup"),
+        ]:
+            if line.lower().startswith(label.lower()) and not fields[key]:
+                value = line[len(label):].strip(" :\t")
+                fields[key] = value or (lines[index + 1] if index + 1 < len(lines) else "")
+
+    fields["nameBangla"] = clean_bengali_text(fields["nameBangla"])
+    fields["fatherName"] = clean_bengali_text(fields["fatherName"])
+    fields["motherName"] = clean_bengali_text(fields["motherName"])
+    fields["nameEnglish"] = fields["nameEnglish"].upper()
+    fields["gender"] = fields["gender"].upper()
+    fields["bloodGroup"] = fields["bloodGroup"].upper()
+    return fields
+
+
+def extract_images(doc: fitz.Document) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Find portrait and signature across every page of a 1–3 page PDF."""
+    candidates: list[dict[str, Any]] = []
+    for page_number, page in enumerate(doc):
+        for image_info in page.get_images(full=True):
+            xref = image_info[0]
+            base_image = doc.extract_image(xref)
+            rects = page.get_image_rects(xref)
+            if rects:
+                rect = rects[0]
+                if rect.width > 45 and rect.height > 45:
+                    candidates.append({
+                        "bytes": base_image["image"],
+                        "rect": rect,
+                        "page_number": page_number,
+                    })
+
+    if not candidates:
+        return None, None
+
+    # Usually the portrait is the largest qualifying image. This works even
+    # when the portrait is on page 2 or 3, instead of assuming page 1.
+    portrait = max(candidates, key=lambda item: item["rect"].width * item["rect"].height)
+    signature = None
+
+    # Look for a signature box on the same page and immediately below portrait.
+    page = doc[portrait["page_number"]]
+    photo = portrait["rect"]
+    photo_center_x = (photo.x0 + photo.x1) / 2
+    boxes = []
+    for drawing in page.get_drawings():
+        rect = drawing["rect"]
+        rect_center_x = (rect.x0 + rect.x1) / 2
+        if photo.y1 - 5 < rect.y0 < photo.y1 + 100 and abs(photo_center_x - rect_center_x) < 40:
+            if rect.width > 50 and rect.height > 15:
+                boxes.append(rect)
+    if boxes:
+        target = sorted(boxes, key=lambda rect: rect.y0)[0]
+        crop = fitz.Rect(target.x0 + 2, target.y0 + 2, target.x1 - 2, target.y1 - 2)
+        pix = page.get_pixmap(clip=crop, matrix=fitz.Matrix(5, 5), colorspace=fitz.csRGB, alpha=False)
+        signature = {"bytes": pix.tobytes("png"), "rect": target, "page_number": portrait["page_number"]}
+
+    # Fallback: if no drawing box exists, choose a smaller image below the
+    # portrait on the same page as the signature candidate.
+    if signature is None:
+        same_page = [item for item in candidates if item["page_number"] == portrait["page_number"] and item is not portrait]
+        below = [item for item in same_page if item["rect"].y0 >= photo.y1]
+        if below:
+            signature = min(below, key=lambda item: item["rect"].width * item["rect"].height)
+
+    return portrait, signature
+
+
+def image_to_base64(image: dict[str, Any] | None) -> str | None:
+    return base64.b64encode(image["bytes"]).decode("ascii") if image else None
+
+
+@app.get("/")
+def root() -> dict[str, Any]:
+    return {"success": True, "service": "image-extractor-api", "docs": "/docs"}
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
 
 @app.post("/extract-images")
-async def extract_images(file: UploadFile = File(...)):
+async def extract_images_api(file: UploadFile = File(...)) -> dict[str, Any]:
     pdf_bytes = await file.read()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc[0] 
-    
-    # ১. ইউজার ফটো খুঁজে বের করা (অ্যাঙ্কর পয়েন্ট)
-    all_imgs = []
-    for img_info in page.get_images(full=True):
-        xref = img_info[0]
-        base_image = doc.extract_image(xref)
-        rects = page.get_image_rects(xref)
-        if rects:
-            r = rects[0]
-            if r.width > 45 and r.height > 45:
-                all_imgs.append({"bytes": base_image["image"], "rect": r})
-
-    if not all_imgs:
+    portrait, signature = extract_images(doc)
+    if not portrait:
         return {"success": False, "message": "User photo not found"}
-
-    # ইউজার ফটো নির্ধারণ (সবচেয়ে উপরে ও ডানে থাকা ছবি)
-    all_imgs = sorted(all_imgs, key=lambda x: (x['rect'].y0, -x['rect'].x0))
-    user_photo_info = all_imgs[0]
-    user_photo = base64.b64encode(user_photo_info['bytes']).decode('utf-8')
-    p = user_photo_info['rect'] # ফটোর পজিশন
-
-    # ২. ড্রয়িং বক্স খোঁজা (ছোট বা বড় সব বক্স ধরবে)
-    drawings = page.get_drawings()
-    potential_boxes = []
-    
-    for d in drawings:
-        r = d["rect"]
-        
-        # লজিক: বক্সটি ফটোর নিচে হতে হবে এবং ফটোর সোজাসুজি ডানে/বামে থাকতে হবে
-        # বক্সের কেন্দ্র এবং ফটোর কেন্দ্রের দূরত্বের পার্থক্য কম হতে হবে
-        photo_center_x = (p.x0 + p.x1) / 2
-        rect_center_x = (r.x0 + r.x1) / 2
-        
-        # বক্সটি ফটোর নিচে ১০০ পিক্সেলের মধ্যে থাকতে হবে
-        if r.y0 > p.y1 - 5 and r.y0 < p.y1 + 100:
-            if abs(photo_center_x - rect_center_x) < 40: # ভার্টিক্যাল অ্যালাইনমেন্ট চেক
-                # বক্সের মিনিমাম সাইজ অনেক কমিয়ে দেওয়া হয়েছে যাতে ছোট বক্সও ধরা পড়ে
-                if r.width > 50 and r.height > 15: 
-                    potential_boxes.append(r)
-
-    target_rect = None
-
-    if potential_boxes:
-        # ফটোর সবচেয়ে কাছে যে বক্সটি আছে সেটিই সিগনেচার বক্স
-        # এটি ছোট বক্স বা বড় বক্স যাই হোক না কেন ধরবে
-        final_box = sorted(potential_boxes, key=lambda b: b.y0)[0]
-        
-        # ৩. বক্সের ২ পিক্সেল ভেতর থেকে ক্রপ করা
-        target_rect = fitz.Rect(
-            final_box.x0 + 2, 
-            final_box.y0 + 2, 
-            final_box.x1 - 2, 
-            final_box.y1 - 2
-        )
-    else:
-        # ৪. যদি কোনো ড্রয়িং বক্স না পায়, তবে টেক্সট চেক করবে
-        # "License" লেখাটি কোথায় আছে খুঁজে তার উপর পর্যন্ত কাটবে
-        text_blocks = page.get_text("blocks")
-        license_y = p.y1 + 75 # ডিফল্ট লিমিট
-        
-        for b in text_blocks:
-            if "License" in b[4] or "Document" in b[4]:
-                license_y = b[1] - 2 # লেখার ২ পিক্সেল উপরে থামবে
-                break
-        
-        target_rect = fitz.Rect(p.x0, p.y1 + 2, p.x1, license_y)
-
-    # ৫. রেন্ডারিং
-    pix = page.get_pixmap(
-        clip=target_rect, 
-        matrix=fitz.Matrix(5, 5), # ক্লিয়ার রেজাল্টের জন্য ৫ গুণ জুম
-        colorspace=fitz.csRGB, 
-        alpha=False
-    )
-    
-    img_data = pix.tobytes("png")
-    signature = base64.b64encode(img_data).decode('utf-8')
-
     return {
         "success": True,
-        "user_photo": user_photo,
-        "signature": signature
+        "user_photo": image_to_base64(portrait),
+        "signature": image_to_base64(signature),
     }
+
+
+@app.post("/extract-data")
+async def extract_data_api(file: UploadFile = File(...)) -> dict[str, Any]:
+    """Extract NID-like text fields plus portrait/signature from the first PDF page."""
+    pdf_bytes = await file.read()
+    if not pdf_bytes:
+        return {"success": False, "message": "Empty PDF file"}
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        if doc.page_count == 0:
+            return {"success": False, "message": "PDF has no pages"}
+        text = "\n".join(page.get_text("text") for page in doc)
+        fields = extract_text_fields(text)
+        portrait, signature = extract_images(doc)
+        return {
+            "code": 200,
+            "success": True,
+            "message": "Data fetched successfully",
+            "data": fields,
+            "images": {
+                "user_photo_base64": image_to_base64(portrait),
+                "signature_base64": image_to_base64(signature),
+            },
+        }
+    except Exception as exc:
+        return {"success": False, "message": "PDF parsing error", "details": str(exc)}
